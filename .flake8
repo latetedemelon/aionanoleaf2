@@ -1,0 +1,22 @@
+[flake8]
+max-line-length = 150
+
+# The project uses a deliberate layout of section banners at column 0 and
+# generous blank lines between members. Reformatting it would bury real
+# changes in whitespace churn, so the cosmetic checks are disabled and the
+# ones that catch bugs are kept.
+extend-ignore =
+    E111,
+    E117,
+    E261,
+    E301,
+    E302,
+    E303,
+    W291,
+    W293
+
+# _listen_for_server_sent_events is the only function above 25; its event
+# dispatch loop should be split out in a follow-up.
+max-complexity = 30
+
+exclude = .git,__pycache__,build,dist,.venv

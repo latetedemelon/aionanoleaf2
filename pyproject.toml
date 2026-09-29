@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aionanoleaf2"
+version = "1.0.3"
+description = "Async Python package for the Nanoleaf API that replaces aioNanoleaf."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "LGPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "loebi-ch", email = "andy@slyweb.ch" }]
+keywords = [
+    "nanoleaf", "api", "canvas", "shapes", "elements", "light",
+    "panels", "strips", "essentials", "4d", "emersion",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Natural Language :: English",
+    "Topic :: Home Automation",
+    "Typing :: Typed",
+]
+dependencies = ["aiohttp"]
+
+[project.optional-dependencies]
+test = ["pytest>=7", "pytest-asyncio>=0.21", "mypy", "flake8"]
+
+[project.urls]
+"Source Code" = "https://github.com/loebi-ch/aionanoleaf2"
+"Bug Tracker" = "https://github.com/loebi-ch/aionanoleaf2/issues"
+"Documentation" = "https://github.com/loebi-ch/aionanoleaf2/blob/master/README.md"
+
+[tool.setuptools]
+packages = ["aionanoleaf2"]
+
+[tool.setuptools.package-data]
+aionanoleaf2 = ["py.typed"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.mypy]
+warn_unused_ignores = true
+warn_redundant_casts = true
