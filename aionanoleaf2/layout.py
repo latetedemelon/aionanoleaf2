@@ -105,3 +105,31 @@ class Panel:
             19: LINES_CONTROLLER_CAP,
             20: LINES_POWER_CONNECTOR,
         }.get(self._shape_type_id, Shape(str(self._shape_type_id), None))
+
+    @property
+    def _key(self) -> tuple[int, int, int, int, int]:
+        """Return the identity of this panel for hashing and equality."""
+        return (
+            self._id,
+            self._x_coordinate,
+            self._y_coordinate,
+            self._orientation,
+            self._shape_type_id,
+        )
+
+    def __eq__(self, other: object) -> bool:
+        """Compare panels by value so they can be deduplicated in a set."""
+        if not isinstance(other, Panel):
+            return NotImplemented
+        return self._key == other._key
+
+    def __hash__(self) -> int:
+        """Hash by value to match __eq__."""
+        return hash(self._key)
+
+    def __repr__(self) -> str:
+        """Return a readable representation."""
+        return (
+            f"Panel(id={self._id}, x={self._x_coordinate}, y={self._y_coordinate}, "
+            f"orientation={self._orientation}, shape={self.shape.name!r})"
+        )
