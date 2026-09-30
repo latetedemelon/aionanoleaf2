@@ -36,8 +36,10 @@ from .exceptions import (
     InvalidEmersion,
     InvalidToken,
     NoAuthToken,
+    StreamingUnsupported,
     Unauthorized,
     Unavailable,
+    UnknownPanel,
 )
 
 from .layout import (
@@ -45,7 +47,14 @@ from .layout import (
     Panel,
 )
 
+from .twin import (
+    RGBW,
+    DigitalTwin,
+)
+
 __all__ = [
+    "RGBW",
+    "DigitalTwin",
     "EffectsEvent",
     "InvalidEffect",
     "InvalidEmersion",
@@ -57,8 +66,10 @@ __all__ = [
     "Panel",
     "Shape",
     "StateEvent",
+    "StreamingUnsupported",
     "TouchEvent",
     "TouchStreamEvent",
     "Unauthorized",
     "Unavailable",
+    "UnknownPanel",
 ]

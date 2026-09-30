@@ -1,0 +1,374 @@
+"""Per-panel control through DigitalTwin."""
+from __future__ import annotations
+
+import asyncio
+import struct
+
+import pytest
+
+from aionanoleaf2 import DigitalTwin, NanoleafException, StreamingUnsupported, UnknownPanel
+from aionanoleaf2.twin import STREAM_PORT_V2, _coerce_color, _transition_units
+
+RECORD = struct.Struct(">HBBBBH")
+
+
+def decode(frame: bytes) -> list[tuple[int, int, int, int, int, int]]:
+    """Decode an external control v2 frame into its panel records."""
+    (count,) = struct.unpack_from(">H", frame, 0)
+    offset = 2
+    records = []
+    for _ in range(count):
+        records.append(RECORD.unpack_from(frame, offset))
+        offset += RECORD.size
+    assert offset == len(frame), "frame has trailing bytes"
+    return records
+
+
+# --------------------------------------------------------------------------
+# Colour and transition coercion
+# --------------------------------------------------------------------------
+
+def test_rgb_gets_a_zero_white_channel() -> None:
+    assert _coerce_color((1, 2, 3)) == (1, 2, 3, 0)
+
+
+def test_rgbw_passes_through() -> None:
+    assert _coerce_color((1, 2, 3, 4)) == (1, 2, 3, 4)
+
+
+@pytest.mark.parametrize("color", [(1, 2), (1, 2, 3, 4, 5), ()])
+def test_wrong_component_count_is_rejected(color) -> None:
+    with pytest.raises(ValueError, match="r, g, b"):
+        _coerce_color(color)
+
+
+@pytest.mark.parametrize("color", [(-1, 0, 0), (256, 0, 0), (0, 0, 0, 300)])
+def test_out_of_range_components_are_rejected(color) -> None:
+    with pytest.raises(ValueError, match="0-255"):
+        _coerce_color(color)
+
+
+@pytest.mark.parametrize("color", [(1.5, 0, 0), ("ff", 0, 0), (True, 0, 0)])
+def test_non_int_components_are_rejected(color) -> None:
+    with pytest.raises(TypeError):
+        _coerce_color(color)
+
+
+@pytest.mark.parametrize(
+    ("seconds", "units"), [(None, 0), (0, 0), (0.1, 1), (1, 10), (2.5, 25), (0.04, 0)]
+)
+def test_transition_is_converted_to_deciseconds(seconds, units) -> None:
+    assert _transition_units(seconds) == units
+
+
+def test_negative_transition_is_rejected() -> None:
+    with pytest.raises(ValueError, match="negative"):
+        _transition_units(-1)
+
+
+def test_transition_beyond_the_wire_format_is_rejected() -> None:
+    with pytest.raises(ValueError, match="at most"):
+        _transition_units(7000)
+
+
+# --------------------------------------------------------------------------
+# The buffer
+# --------------------------------------------------------------------------
+
+@pytest.fixture
+def twin(make_nanoleaf) -> DigitalTwin:
+    return DigitalTwin(make_nanoleaf(), [1, 2, 3])
+
+
+def test_every_panel_starts_black(twin: DigitalTwin) -> None:
+    assert twin.colors == {1: (0, 0, 0, 0), 2: (0, 0, 0, 0), 3: (0, 0, 0, 0)}
+
+
+def test_panel_ids_are_reported_in_frame_order(twin: DigitalTwin) -> None:
+    assert twin.panel_ids == (1, 2, 3)
+
+
+def test_set_and_get_one_panel(twin: DigitalTwin) -> None:
+    twin.set_color(2, (10, 20, 30))
+    assert twin.get_color(2) == (10, 20, 30, 0)
+    assert twin.get_color(1) == (0, 0, 0, 0)
+
+
+def test_set_all(twin: DigitalTwin) -> None:
+    twin.set_all((5, 6, 7, 8))
+    assert set(twin.colors.values()) == {(5, 6, 7, 8)}
+
+
+def test_set_colors_leaves_other_panels_alone(twin: DigitalTwin) -> None:
+    twin.set_color(3, (9, 9, 9))
+    twin.set_colors({1: (1, 1, 1), 2: (2, 2, 2)})
+    assert twin.colors == {1: (1, 1, 1, 0), 2: (2, 2, 2, 0), 3: (9, 9, 9, 0)}
+
+
+def test_set_colors_is_all_or_nothing(twin: DigitalTwin) -> None:
+    """A bad entry must not leave the buffer half applied."""
+    with pytest.raises(UnknownPanel):
+        twin.set_colors({1: (1, 1, 1), 99: (2, 2, 2)})
+    assert twin.get_color(1) == (0, 0, 0, 0)
+
+    with pytest.raises(ValueError):
+        twin.set_colors({1: (1, 1, 1), 2: (300, 0, 0)})
+    assert twin.get_color(1) == (0, 0, 0, 0)
+
+
+def test_unknown_panel_on_get_and_set(twin: DigitalTwin) -> None:
+    with pytest.raises(UnknownPanel):
+        twin.get_color(99)
+    with pytest.raises(UnknownPanel):
+        twin.set_color(99, (1, 1, 1))
+
+
+def test_unknown_panel_is_also_a_keyerror(twin: DigitalTwin) -> None:
+    """So that existing dict-style error handling keeps working."""
+    assert issubclass(UnknownPanel, KeyError)
+
+
+def test_colors_returns_a_copy(twin: DigitalTwin) -> None:
+    snapshot = twin.colors
+    twin.set_all((1, 2, 3))
+    assert snapshot[1] == (0, 0, 0, 0)
+
+
+def test_a_device_with_no_panels_cannot_be_mirrored(make_nanoleaf) -> None:
+    with pytest.raises(NanoleafException, match="no panels"):
+        DigitalTwin(make_nanoleaf(), [])
+
+
+def test_repr_is_useful(twin: DigitalTwin) -> None:
+    assert repr(twin) == "DigitalTwin(panels=3, streaming=False)"
+
+
+# --------------------------------------------------------------------------
+# Encoding
+# --------------------------------------------------------------------------
+
+def test_anim_data_layout(twin: DigitalTwin) -> None:
+    twin.set_color(1, (255, 0, 0))
+    twin.set_color(2, (0, 255, 0, 128))
+    # count, then per panel: id, frames, r, g, b, w, transition
+    assert twin._build_anim_data(0) == (
+        "3 1 1 255 0 0 0 0 2 1 0 255 0 128 0 3 1 0 0 0 0 0"
+    )
+
+
+def test_anim_data_carries_the_transition(twin: DigitalTwin) -> None:
+    assert twin._build_anim_data(10).split()[7] == "10"
+
+
+def test_stream_frame_round_trips(twin: DigitalTwin) -> None:
+    twin.set_colors({1: (255, 0, 0), 2: (0, 255, 0, 7), 3: (0, 0, 255)})
+    assert decode(twin._build_stream_frame(3)) == [
+        (1, 255, 0, 0, 0, 3),
+        (2, 0, 255, 0, 7, 3),
+        (3, 0, 0, 255, 0, 3),
+    ]
+
+
+def test_stream_frame_size(twin: DigitalTwin) -> None:
+    # uint16 count, then per panel: uint16 id + 4 colour bytes + uint16 transition
+    assert RECORD.size == 8
+    assert len(twin._build_stream_frame(0)) == 2 + 3 * 8
+
+
+def test_large_panel_ids_survive_encoding(make_nanoleaf) -> None:
+    twin = DigitalTwin(make_nanoleaf(), [65534])
+    twin.set_color(65534, (1, 2, 3))
+    assert decode(twin._build_stream_frame(0)) == [(65534, 1, 2, 3, 0, 0)]
+
+
+# --------------------------------------------------------------------------
+# Building a twin from a device
+# --------------------------------------------------------------------------
+
+async def test_digital_twin_fetches_the_layout(device, make_nanoleaf) -> None:
+    nanoleaf = make_nanoleaf()
+    twin = await nanoleaf.digital_twin()
+    assert twin.panel_ids == (1, 2)
+
+
+async def test_digital_twin_accepts_a_subset(device, make_nanoleaf) -> None:
+    nanoleaf = make_nanoleaf()
+    await nanoleaf.get_info()
+    twin = await nanoleaf.digital_twin(panel_ids=[2])
+    assert twin.panel_ids == (2,)
+
+
+async def test_digital_twin_on_a_panelless_device(device, make_nanoleaf) -> None:
+    from tests.conftest import ESSENTIALS_INFO, ESSENTIALS_STATE
+
+    device.info = dict(ESSENTIALS_INFO)
+    device.state = dict(ESSENTIALS_STATE)
+    nanoleaf = make_nanoleaf()
+    with pytest.raises(NanoleafException, match="no panels"):
+        await nanoleaf.digital_twin()
+
+
+# --------------------------------------------------------------------------
+# sync() over HTTP
+# --------------------------------------------------------------------------
+
+async def test_sync_writes_a_static_effect(device, make_nanoleaf) -> None:
+    nanoleaf = make_nanoleaf()
+    twin = await nanoleaf.digital_twin()
+    twin.set_color(1, (255, 0, 0))
+    await twin.sync()
+
+    write = device.effect_writes[-1]
+    assert write["command"] == "display"
+    assert write["animType"] == "static"
+    assert write["loop"] is False
+    assert write["palette"] == []
+    assert write["animData"] == "2 1 1 255 0 0 0 0 2 1 0 0 0 0 0"
+
+
+async def test_sync_with_a_transition(device, make_nanoleaf) -> None:
+    nanoleaf = make_nanoleaf()
+    twin = await nanoleaf.digital_twin()
+    await twin.sync(transition=1.5)
+    assert device.effect_writes[-1]["animData"].split()[7] == "15"
+
+
+# --------------------------------------------------------------------------
+# Streaming over UDP
+# --------------------------------------------------------------------------
+
+async def test_streaming_sends_udp_frames(device, make_nanoleaf, udp_sink) -> None:
+    device.ext_control_response = {
+        "streamControlIpAddr": "127.0.0.1",
+        "streamControlPort": udp_sink.port,
+        "streamControlProtocol": "UDP",
+    }
+    nanoleaf = make_nanoleaf()
+    twin = await nanoleaf.digital_twin()
+
+    async with twin.streaming():
+        assert twin.is_streaming
+        twin.set_all((1, 2, 3))
+        await twin.sync()
+        twin.set_all((4, 5, 6))
+        await twin.sync(transition=0.2)
+        await asyncio.sleep(0.05)
+
+    assert not twin.is_streaming
+    assert len(udp_sink.frames) == 2
+    assert decode(udp_sink.frames[0]) == [(1, 1, 2, 3, 0, 0), (2, 1, 2, 3, 0, 0)]
+    assert decode(udp_sink.frames[1]) == [(1, 4, 5, 6, 0, 2), (2, 4, 5, 6, 0, 2)]
+
+
+async def test_streaming_enables_external_control_first(device, make_nanoleaf, udp_sink) -> None:
+    device.ext_control_response = {"streamControlPort": udp_sink.port}
+    nanoleaf = make_nanoleaf()
+    twin = await nanoleaf.digital_twin()
+    async with twin.streaming():
+        pass
+    assert device.effect_writes[0] == {
+        "command": "display",
+        "animType": "extControl",
+        "extControlVersion": "v2",
+    }
+
+
+async def test_sync_falls_back_to_http_after_streaming(device, make_nanoleaf, udp_sink) -> None:
+    device.ext_control_response = {"streamControlPort": udp_sink.port}
+    nanoleaf = make_nanoleaf()
+    twin = await nanoleaf.digital_twin()
+    async with twin.streaming():
+        await twin.sync()
+    await twin.sync()
+    assert device.effect_writes[-1]["animType"] == "static"
+
+
+async def test_streaming_cannot_be_nested(device, make_nanoleaf, udp_sink) -> None:
+    device.ext_control_response = {"streamControlPort": udp_sink.port}
+    nanoleaf = make_nanoleaf()
+    twin = await nanoleaf.digital_twin()
+    async with twin.streaming():
+        with pytest.raises(NanoleafException, match="already open"):
+            async with twin.streaming():
+                pass
+
+
+async def test_streaming_releases_the_socket_on_error(device, make_nanoleaf, udp_sink) -> None:
+    device.ext_control_response = {"streamControlPort": udp_sink.port}
+    nanoleaf = make_nanoleaf()
+    twin = await nanoleaf.digital_twin()
+    with pytest.raises(RuntimeError):
+        async with twin.streaming():
+            raise RuntimeError("boom")
+    assert not twin.is_streaming
+
+
+async def test_restore_effect_reselects_the_previous_effect(device, make_nanoleaf, udp_sink) -> None:
+    device.ext_control_response = {"streamControlPort": udp_sink.port}
+    nanoleaf = make_nanoleaf()
+    await nanoleaf.get_info()
+    assert nanoleaf.selected_effect == "Nemo"
+    twin = await nanoleaf.digital_twin()
+
+    async with twin.streaming(restore_effect=True):
+        await twin.sync()
+
+    assert device.bodies[-1] == {"select": "Nemo"}
+
+
+async def test_effect_is_not_restored_by_default(device, make_nanoleaf, udp_sink) -> None:
+    device.ext_control_response = {"streamControlPort": udp_sink.port}
+    nanoleaf = make_nanoleaf()
+    await nanoleaf.get_info()
+    twin = await nanoleaf.digital_twin()
+    async with twin.streaming():
+        await twin.sync()
+    assert {"select": "Nemo"} not in device.bodies
+
+
+# --------------------------------------------------------------------------
+# Negotiating external control
+# --------------------------------------------------------------------------
+
+async def test_a_204_means_the_default_v2_port(device, make_nanoleaf) -> None:
+    device.ext_control_response = None
+    nanoleaf = make_nanoleaf()
+    host, port = await nanoleaf._enable_external_control()
+    assert (host, port) == ("127.0.0.1", STREAM_PORT_V2)
+
+
+async def test_a_reported_port_is_used(device, make_nanoleaf) -> None:
+    device.ext_control_response = {"streamControlPort": 12345, "streamControlProtocol": "UDP"}
+    nanoleaf = make_nanoleaf()
+    _, port = await nanoleaf._enable_external_control()
+    assert port == 12345
+
+
+async def test_the_configured_host_wins_over_the_reported_one(device, make_nanoleaf) -> None:
+    """The device reports its own address; ours is the one known to route."""
+    device.ext_control_response = {"streamControlIpAddr": "10.9.9.9", "streamControlPort": 1}
+    nanoleaf = make_nanoleaf()
+    host, _ = await nanoleaf._enable_external_control()
+    assert host == "127.0.0.1"
+
+
+async def test_a_non_udp_protocol_is_refused(device, make_nanoleaf) -> None:
+    device.ext_control_response = {"streamControlProtocol": "TCP"}
+    nanoleaf = make_nanoleaf()
+    with pytest.raises(StreamingUnsupported, match="TCP"):
+        await nanoleaf._enable_external_control()
+
+
+async def test_a_device_that_rejects_external_control(device, make_nanoleaf) -> None:
+    device.effects_status = 422
+    nanoleaf = make_nanoleaf()
+    with pytest.raises(StreamingUnsupported, match="422"):
+        await nanoleaf._enable_external_control()
+
+
+async def test_ipv6_host_is_unbracketed_for_the_socket(session) -> None:
+    from aionanoleaf2 import Nanoleaf
+
+    nanoleaf = Nanoleaf(session, "fe80::1%eth0", auth_token="T")
+    assert nanoleaf.host == "[fe80::1%eth0]"
+    assert nanoleaf._bare_host == "fe80::1%eth0"

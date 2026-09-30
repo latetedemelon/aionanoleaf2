@@ -29,7 +29,7 @@ import socket
 import struct
 
 from .layout import Panel
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 from .typing import InfoData, EmersionData
 
 from aiohttp import (
@@ -56,9 +56,12 @@ from .exceptions import (
     InvalidToken,
     NanoleafException,
     NoAuthToken,
+    StreamingUnsupported,
     Unauthorized,
     Unavailable,
 )
+
+from .twin import STREAM_PORT_V2, DigitalTwin
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -268,6 +271,11 @@ class Nanoleaf:
     def _api_url(self) -> str:
         return f"http://{self.host}:{self.port}/api/v1"
 
+    @property
+    def _bare_host(self) -> str:
+        """Return the host without URL brackets, keeping any IPv6 zone ID."""
+        return self._host.strip("[]")
+
 
 
 
@@ -447,6 +455,27 @@ class Nanoleaf:
 
     
     
+# Build a digital twin: a local RGBW buffer with one entry per panel.
+    async def digital_twin(
+        self, panel_ids: Iterable[int] | None = None
+    ) -> DigitalTwin:
+        """Return a DigitalTwin for this device's panels.
+
+        Fetches the layout first if it is not known yet. Panels are ordered by
+        ID so that successive frames address them consistently. Pass
+        `panel_ids` to cover a subset, for example to skip a controller panel.
+
+        The device cannot report the current colour of a panel, so every entry
+        starts black; call `set_all` first if that matters.
+        """
+        if panel_ids is None:
+            if not self._panels:
+                await self.get_info()
+            panel_ids = sorted(panel.id for panel in self._panels)
+        return DigitalTwin(self, panel_ids)
+
+
+
 # Activate a Screen Mirroring mode on the device (if supported).
     async def set_emersion(self, emersion: str) -> None:
         if emersion not in self.emersion_list:
@@ -660,6 +689,65 @@ class Nanoleaf:
         if transition is not None:
             data[topic]["duration"] = transition
         await self._request("put", "state", data)
+
+
+
+# Write a static effect, which is how per-panel colours are set over HTTP.
+    async def _write_static_effect(self, anim_data: str) -> None:
+        await self._request(
+            "put",
+            "effects",
+            {
+                "write": {
+                    "command": "display",
+                    "animType": "static",
+                    "animData": anim_data,
+                    "loop": False,
+                    "palette": [],
+                }
+            },
+        )
+
+
+
+# Put the device into external control mode and report where to send frames.
+    async def _enable_external_control(self) -> tuple[str, int]:
+        try:
+            resp = await self._request(
+                "put",
+                "effects",
+                {
+                    "write": {
+                        "command": "display",
+                        "animType": "extControl",
+                        "extControlVersion": "v2",
+                    }
+                },
+            )
+        except ClientResponseError as err:
+            raise StreamingUnsupported(
+                f"Device refused external control (HTTP {err.status})"
+            ) from err
+
+        # v2 devices answer 204; Light Panels answer with the socket to use.
+        # Only the port is taken from the body: the address it reports is the
+        # device's own, while the configured host is what is known to route.
+        port = STREAM_PORT_V2
+        try:
+            data = await resp.json(content_type=None)
+        except (ValueError, ClientError):
+            data = None
+
+        if isinstance(data, dict):
+            protocol = data.get("streamControlProtocol")
+            if protocol is not None and protocol != "UDP":
+                raise StreamingUnsupported(
+                    f"Device asked for {protocol} streaming, which is not supported"
+                )
+            if (reported := data.get("streamControlPort")) is not None:
+                port = int(reported)
+
+        return self._bare_host, port
 
 
 

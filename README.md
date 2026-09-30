@@ -7,6 +7,7 @@ The original aioNanoleaf has been modified to:
 - add support for Nanoleaf Essentials devices.
 - add support for Screen Mirroring emersion modes (1D, 2D, 3D, 4D).
 - add support for IPv6 hosts.
+- add per-panel control through a digital twin, over HTTP or UDP streaming.
 
 ## Installation
 ```bash
@@ -56,4 +57,64 @@ async def test():
         await nanoleaf.deauthorize()
 
 run(test())
+```
+
+Runnable versions of the snippets below are in [`examples/`](examples).
+
+## Per-panel control (digital twin)
+
+A `DigitalTwin` is a local buffer holding one RGBW colour per panel. Changing
+it does nothing on its own; `sync()` writes the whole buffer to the device.
+
+```python
+twin = await nanoleaf.digital_twin()
+
+twin.set_all((0, 0, 40))                 # (r, g, b) or (r, g, b, w), each 0-255
+twin.set_color(twin.panel_ids[0], (255, 0, 0))
+twin.set_colors({1: (0, 255, 0), 2: (0, 0, 255)})
+
+await twin.sync(transition=0.5)          # transition is in seconds
+```
+
+`sync()` writes a *static effect* over HTTP. That works on every panel device
+and persists until another effect is selected, but each call is a round trip.
+
+### Streaming
+
+For animation, open a streaming session. Inside it `sync()` sends a single UDP
+datagram per call instead, which is roughly a thousand times cheaper:
+
+```python
+async with twin.streaming():
+    for frame in animation:
+        twin.set_all(frame)
+        await twin.sync()
+        await asyncio.sleep(1 / 30)
+```
+
+On exit the panels keep whatever the last frame set them to. Pass
+`streaming(restore_effect=True)` to re-select the effect that was active
+beforehand.
+
+Streaming uses Nanoleaf external control v2, which covers Canvas, Shapes,
+Elements and Lines. A device that refuses the session raises
+`StreamingUnsupported`.
+
+### Notes
+
+- The device cannot report the current colour of a panel, so a new twin starts
+  with every panel black. Call `set_all()` first if that matters.
+- Panels are ordered by ID. Pass `digital_twin(panel_ids=[...])` to cover a
+  subset, for example to skip a controller panel.
+- An unknown panel ID raises `UnknownPanel`, which is also a `KeyError`.
+- `set_colors()` validates everything before applying anything, so a bad entry
+  cannot leave the buffer half updated.
+
+## Development
+
+```bash
+pip install -e ".[test]"
+pytest          # 114 tests, no hardware needed
+mypy aionanoleaf2
+flake8 aionanoleaf2 tests
 ```

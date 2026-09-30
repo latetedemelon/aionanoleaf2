@@ -71,6 +71,11 @@ class FakeNanoleaf:
         self.selected_effect: Any = None
         self.sse_body: bytes | None = None
         self.events_status = 200
+        # Body to answer an extControl write with. None means 204, which is
+        # what a v2 device (Canvas, Shapes, Elements, Lines) sends.
+        self.ext_control_response: dict[str, Any] | None = None
+        self.effect_writes: list[dict[str, Any]] = []
+        self.effects_status = 204
         self.requests: list[tuple[str, str]] = []
         self.bodies: list[Any] = []
         self._runner: web.AppRunner | None = None
@@ -124,6 +129,16 @@ class FakeNanoleaf:
                 return web.json_response(self.info)
             return web.Response(status=204)
 
+        if suffix == "effects" and request.method == "PUT":
+            body = self.bodies[-1]
+            if "write" in body:
+                self.effect_writes.append(body["write"])
+            if self.effects_status != 204:
+                return web.Response(status=self.effects_status)
+            if self.ext_control_response is not None:
+                return web.json_response(self.ext_control_response)
+            return web.Response(status=204)
+
         if suffix == "state" and request.method == "GET":
             if self.state is None:
                 return web.Response(status=404)
@@ -169,3 +184,41 @@ def make_nanoleaf(device, session):
         return Nanoleaf(session, "127.0.0.1", **kwargs)
 
     return _make
+
+
+class UdpSink:
+    """Collect datagrams sent to an ephemeral local UDP port."""
+
+    def __init__(self) -> None:
+        self.frames: list[bytes] = []
+        self.port = 0
+        self._transport: asyncio.DatagramTransport | None = None
+
+    async def start(self) -> None:
+        loop = asyncio.get_running_loop()
+        sink = self
+
+        class _Protocol(asyncio.DatagramProtocol):
+            def datagram_received(self, data: bytes, addr: Any) -> None:
+                sink.frames.append(data)
+
+        transport, _ = await loop.create_datagram_endpoint(
+            _Protocol, local_addr=("127.0.0.1", 0)
+        )
+        self._transport = transport
+        self.port = transport.get_extra_info("socket").getsockname()[1]
+
+    def close(self) -> None:
+        if self._transport is not None:
+            self._transport.close()
+
+
+@pytest.fixture
+async def udp_sink():
+    """A local UDP socket standing in for the device's streaming port."""
+    sink = UdpSink()
+    await sink.start()
+    try:
+        yield sink
+    finally:
+        sink.close()
