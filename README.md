@@ -283,6 +283,15 @@ All of these derive from `NanoleafException`.
 
 Both take the device address as an argument.
 
+## Home Assistant
+
+Home Assistant's built-in Nanoleaf integration pins the library version it wants,
+so installing this fork alongside it is not enough — Home Assistant reinstalls
+its pinned release on the next restart. [`ha-patch/`](ha-patch) has a script that
+regenerates Home Assistant's integration into `custom_components/` with the
+requirement pointed here instead, and a `--check` mode that tells you when a
+Home Assistant upgrade means re-running it.
+
 ## Development
 
 ```bash
