@@ -22,9 +22,11 @@
 from __future__ import annotations
 
 import asyncio
-import json
-import socket
 import ipaddress
+import json
+import logging
+import socket
+import struct
 
 from .layout import Panel
 from typing import Any, Callable
@@ -34,6 +36,7 @@ from aiohttp import (
     ClientConnectorError,
     ClientError,
     ClientResponse,
+    ClientResponseError,
     ClientSession,
     ClientTimeout,
     ClientConnectionError,
@@ -56,6 +59,20 @@ from .exceptions import (
     Unauthorized,
     Unavailable,
 )
+
+_LOGGER = logging.getLogger(__name__)
+
+# Delay before the first retry; doubled for each subsequent attempt.
+_RETRY_BACKOFF = 0.5
+
+# Touch data stream wire format: a uint16 panel count followed by one record
+# per panel of uint16 panel ID, a packed touch-type/strength byte and the
+# uint16 ID of the panel a swipe ended on.
+_TOUCH_HEADER = struct.Struct(">H")
+_TOUCH_RECORD = struct.Struct(">HBH")
+
+# Raised when an optional sub-resource is absent (404) or the device is away.
+_OPTIONAL_RESOURCE_ERRORS = (Unavailable, ClientResponseError)
 
 # Models that support Screen Mirroring
 EMERSION_MODELS = ["NL69"]
@@ -95,7 +112,7 @@ class Nanoleaf:
         self._serial_no = ""
         self._manufacturer = ""
         self._firmware_version = ""
-        self._hardware_version = None
+        self._hardware_version: str | None = None
         self._model = ""
         self._is_on = False
         self._brightness = 0
@@ -111,11 +128,13 @@ class Nanoleaf:
         self._color_temperature_max = 0
         self._color_temperature_min = 0
         self._color_mode = ""
-        self._effects_list = []
+        self._effects_list: list[str] = []
         self._effect = ""
-        self._emersion_list = []
+        self._emersion_list: list[str] = []
         self._emersion = ""
-        self._panels = set()
+        self._panels: set[Panel] = set()
+        # asyncio only holds weak references to tasks, so keep our own.
+        self._tasks: set[asyncio.Task[Any]] = set()
 
 
 
@@ -264,7 +283,9 @@ class Nanoleaf:
             
         if resp.status == 403:
             raise Unauthorized(
-                "Hold the on-off button down for 5-7 seconds until the LEDs start flashing or activate the API in the Nanoleaf app and try again within 30 seconds."
+                "Hold the on-off button down for 5-7 seconds until the LEDs start "
+                "flashing or activate the API in the Nanoleaf app and try again "
+                "within 30 seconds."
             )
         resp.raise_for_status()
         self._auth_token = (await resp.json())["auth_token"]
@@ -291,35 +312,42 @@ class Nanoleaf:
         self._hardware_version = data.get("hardwareVersion")
         self._model = data["model"]
         
-        # Populate state (light status)
-        state = data["state"]
-        self._is_on = state["on"]["value"]
-        self._brightness = state["brightness"]["value"]
-        self._brightness_max = state["brightness"]["max"]
-        self._brightness_min = state["brightness"]["min"]
-        self._hue = state["hue"]["value"]
-        self._hue_max = state["hue"]["max"]
-        self._hue_min = state["hue"]["min"]
-        self._saturation = state["sat"]["value"]
-        self._saturation_max = state["sat"]["max"]
-        self._saturation_min = state["sat"]["min"]
-        self._color_temperature = state["ct"]["value"]
-        self._color_temperature_max = state["ct"]["max"]
-        self._color_temperature_min = state["ct"]["min"]
-        self._color_mode = state["colorMode"]
+        # Nanoleaf Essentials (and Matter Wi-Fi devices such as the Ceiling Light)
+        # return identity fields only, so the state has to be fetched separately.
+        state = data.get("state")
+        if state is None:
+            try:
+                resp = await self._request("get", "state")
+                state = await resp.json()
+            except _OPTIONAL_RESOURCE_ERRORS:
+                _LOGGER.debug("%s: no state in info payload and GET state failed", self._host)
+                state = {}
+
+        self._is_on = bool(state.get("on", {}).get("value", self._is_on))
+        brightness = state.get("brightness", {})
+        self._brightness = brightness.get("value", self._brightness)
+        self._brightness_max = brightness.get("max", self._brightness_max)
+        self._brightness_min = brightness.get("min", self._brightness_min)
+        hue = state.get("hue", {})
+        self._hue = hue.get("value", self._hue)
+        self._hue_max = hue.get("max", self._hue_max)
+        self._hue_min = hue.get("min", self._hue_min)
+        saturation = state.get("sat", {})
+        self._saturation = saturation.get("value", self._saturation)
+        self._saturation_max = saturation.get("max", self._saturation_max)
+        self._saturation_min = saturation.get("min", self._saturation_min)
+        color_temperature = state.get("ct", {})
+        self._color_temperature = color_temperature.get("value", self._color_temperature)
+        self._color_temperature_max = color_temperature.get("max", self._color_temperature_max)
+        self._color_temperature_min = color_temperature.get("min", self._color_temperature_min)
+        self._color_mode = state.get("colorMode", self._color_mode)
 
         # Nanoleaf Essentials are missing the effectsList in the main payload, so we have to fetch it separately.
         effects = data.get("effects", {})
-        try:
-            self._effects_list = effects.get("effectsList") or await self.get_effects()
-        except Unavailable:
-             self._effects_list = []
+        self._effects_list = effects.get("effectsList") or await self.get_effects()
 
         # Nanoleaf Essentials are missing the selected effect, so we have to fetch it separately.
-        try:
-            self._effect = effects.get("select") or await self.get_selected_effect()
-        except Unavailable:
-            self._effect = ""
+        self._effect = effects.get("select") or await self.get_selected_effect() or ""
 
         # Populate panels layout if available.
         try:
@@ -337,9 +365,13 @@ class Nanoleaf:
     async def get_effects(self) -> list[str]:
         try:
             resp = await self._request("get", "effects/effectsList")
-            return await resp.json()
-        except Unavailable:
+            data = await resp.json()
+        except _OPTIONAL_RESOURCE_ERRORS:
             return []
+        # Some firmwares answer with the bare list, others wrap it in an object.
+        if isinstance(data, dict):
+            return data.get("effectsList") or []
+        return data or []
 
 
 
@@ -347,9 +379,12 @@ class Nanoleaf:
     async def get_selected_effect(self) -> str | None:
         try:
             resp = await self._request("get", "effects/select")
-            return await resp.json()
-        except Unavailable:
+            data = await resp.json()
+        except _OPTIONAL_RESOURCE_ERRORS:
             return None
+        if isinstance(data, dict):
+            return data.get("select") or None
+        return data
 
 
 
@@ -518,6 +553,25 @@ class Nanoleaf:
 
 # --- PRIVATE HELPER METHODS ---
 
+# Run a callback coroutine, keeping a reference so it cannot be garbage collected.
+    def _spawn(self, coro: Any) -> None:
+        if not asyncio.iscoroutine(coro):
+            raise TypeError(
+                "Nanoleaf event callbacks must be coroutine functions (async def)"
+            )
+        task = asyncio.ensure_future(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._on_callback_done)
+
+# Drop the finished task and surface anything it raised.
+    def _on_callback_done(self, task: asyncio.Task[Any]) -> None:
+        self._tasks.discard(task)
+        if task.cancelled():
+            return
+        if (err := task.exception()) is not None:
+            _LOGGER.exception("Nanoleaf event callback failed", exc_info=err)
+
+
 # Make an authorized request to the Nanoleaf device. Handles retries for network errors but fails fast for logic/auth errors.
     async def _request(
         self, method: str, path: str, data: dict | None = None
@@ -543,44 +597,50 @@ class Nanoleaf:
             except (ClientConnectionError, asyncio.TimeoutError) as err:
                 # Store error and try again if it's a connection issue.
                 last_error = err
+                # Back off before retrying; a device that is rebooting needs
+                # more than the few hundred microseconds a bare loop gives it.
+                if attempt + 1 < self._retries:
+                    await asyncio.sleep(_RETRY_BACKOFF * 2 ** attempt)
                 
             except ClientError as err:
-                # Re-raise 401s if they happen inside ClientError wrapper
-                if hasattr(err, 'status') and err.status == 401:
-                     raise InvalidToken
                 # Other HTTP errors (e.g. 404, 422) are raised immediately.
                 raise err
 
         # If we exit the loop, retries were exhausted.
         if last_error:
+            _LOGGER.debug(
+                "%s: %s %s failed after %s attempts", self._host, method, path, self._retries
+            )
             raise Unavailable from last_error
             
         raise Unavailable("Unknown error occurred!")
 
 
 
-# Bracket IPv6 literals and percent-encode zone IDs per RFC 6874.
+# Bracket IPv6 literals so they can be used in a URL authority.
     def _format_host(self, host: str) -> str:
         if not host:
             return host
-            
-        #Remove brackets
+
+        # Accept input that is already bracketed, and ignore stray whitespace.
         raw = host.strip().strip("[]")
-        
-        #Split IP and zones
+
+        # A zone ID ("%eth0") is part of the address, not of the URL path.
         parts = raw.split("%", 1)
         ip_part = parts[0]
-        
+
         try:
-            # Check for valid IPv6
             ipaddress.IPv6Address(ip_part)
-            
-            # Format IPv6
-            if len(parts) > 1:
-                return f"[{ip_part}%25{parts[1]}]"
-            return f"[{ip_part}]"
         except ValueError:
-            return host  # No valid IPv6 (we just return the original value)
+            return raw  # IPv4 literal or hostname: use as-is.
+
+        # NOTE: RFC 6874 asks for the zone ID to be percent-encoded as "%25",
+        # but aiohttp/yarl hand the decoded host straight to getaddrinfo, which
+        # only accepts a literal "%". Encoding it makes every link-local
+        # connection fail, so keep the separator verbatim.
+        if len(parts) > 1:
+            return f"[{ip_part}%{parts[1]}]"
+        return f"[{ip_part}]"
 
 
 
@@ -603,6 +663,32 @@ class Nanoleaf:
 
 
 
+# Resolve the configured host to the set of addresses it may send UDP data from.
+    async def _resolve_host_addresses(self) -> frozenset[str]:
+        bare = self._host.strip("[]").split("%", 1)[0]
+
+        literal = _normalize_address(bare)
+        if literal is not None:
+            return frozenset({literal})
+
+        # A hostname has to be resolved before it can be compared to a packet source.
+        loop = asyncio.get_running_loop()
+        try:
+            infos = await loop.getaddrinfo(bare, None, type=socket.SOCK_DGRAM)
+        except socket.gaierror as err:
+            raise NanoleafException(f"Could not resolve host {bare!r}") from err
+
+        addresses = {
+            normalized
+            for info in infos
+            if (normalized := _normalize_address(str(info[4][0]))) is not None
+        }
+        if not addresses:
+            raise NanoleafException(f"Could not resolve host {bare!r}")
+        return frozenset(addresses)
+
+
+
 # Open a local UDP socket to receive high-frequency touch stream events.
     async def _open_udp_socket_for_touch_data_stream(
         self,
@@ -611,14 +697,19 @@ class Nanoleaf:
         local_port: int | None = None,
     ) -> int:
         if local_ip is None:
-            local_ip = "0.0.0.0"
+            # Bind a dual-stack socket when the device is reachable over IPv6,
+            # otherwise "0.0.0.0" would drop every packet it sends.
+            local_ip = "::" if self._host.startswith("[") else "0.0.0.0"
         if local_port is None:
             local_port = 0 # 0 means OS chooses a free port
-            
+
+        # The source check needs bare addresses, not the bracketed URL host.
+        allowed = await self._resolve_host_addresses()
+
         loop = asyncio.get_running_loop()
         # Create a Datagram (UDP) endpoint
         transport, _ = await loop.create_datagram_endpoint(
-            lambda: _NanoleafTouchProtocol(self.host, callback),
+            lambda: _NanoleafTouchProtocol(allowed, callback),
             local_addr=(local_ip, local_port),
         )
         touch_socket: socket.socket = transport.get_extra_info("socket")
@@ -709,14 +800,18 @@ class Nanoleaf:
                                     event = StateEvent(event_data)
                                     # Update internal state if attribute exists
                                     if hasattr(self, f"_{event.attribute}"):
-                                        setattr(self, f"_{event.attribute}", event.value)
+                                        value = event.value
+                                        # The API sends 1/0 for "on"; is_on is a bool.
+                                        if event.attribute == "is_on":
+                                            value = bool(value)
+                                        setattr(self, f"_{event.attribute}", value)
                                     if state_callback:
-                                        asyncio.create_task(state_callback(event))
+                                        self._spawn(state_callback(event))
 
                                 elif event_type_id == LayoutEvent.EVENT_TYPE_ID:
                                     layout_event = LayoutEvent(event_data)
                                     if layout_callback:
-                                        asyncio.create_task(layout_callback(layout_event))
+                                        self._spawn(layout_callback(layout_event))
 
                                 elif event_type_id == EffectsEvent.EVENT_TYPE_ID:
                                     effects_event = EffectsEvent(event_data)
@@ -725,44 +820,85 @@ class Nanoleaf:
                                     if effects_event.effect == "*Emersion*":
                                         await self.get_emersion()
                                     if effects_callback:
-                                        asyncio.create_task(effects_callback(effects_event))
+                                        self._spawn(effects_callback(effects_event))
 
                                 elif event_type_id == TouchEvent.EVENT_TYPE_ID:
                                     touch_event = TouchEvent(event_data)
                                     if touch_callback:
-                                        asyncio.create_task(touch_callback(touch_event))
-            except ClientError:
+                                        self._spawn(touch_callback(touch_event))
+            except ClientError as err:
                 # Connection dropped, wait and reconnect
+                _LOGGER.debug("%s: event stream dropped (%s), reconnecting", self._host, err)
                 await asyncio.sleep(5)
 
+
+
+# Reduce an address to a comparable form, or None if it is not an IP literal.
+def _normalize_address(value: str) -> str | None:
+    try:
+        address = ipaddress.ip_address(value.strip().strip("[]").split("%", 1)[0])
+    except ValueError:
+        return None
+    # An IPv6 socket reports IPv4 peers as "::ffff:192.0.2.1".
+    mapped = getattr(address, "ipv4_mapped", None)
+    return (mapped or address).compressed
+
+
+# Decode a touch data stream datagram into one event per reported panel.
+def parse_touch_stream(data: bytes) -> list[TouchStreamEvent]:
+    if len(data) < _TOUCH_HEADER.size:
+        return []
+
+    (panel_count,) = _TOUCH_HEADER.unpack_from(data, 0)
+    offset = _TOUCH_HEADER.size
+    events = []
+
+    for _ in range(panel_count):
+        if offset + _TOUCH_RECORD.size > len(data):
+            _LOGGER.debug(
+                "Truncated touch packet: %s panels announced, %s bytes received",
+                panel_count,
+                len(data),
+            )
+            break
+        panel_id, touch_byte, swiped_panel_id = _TOUCH_RECORD.unpack_from(data, offset)
+        offset += _TOUCH_RECORD.size
+        events.append(
+            TouchStreamEvent(
+                panel_id=panel_id,
+                touch_type_id=touch_byte >> 4,
+                strength=touch_byte & 0x0F,
+                panel_id_2=swiped_panel_id,
+            )
+        )
+
+    return events
 
 
 # Protocol to handle UDP touch stream packets from the Nanoleaf device.
 class _NanoleafTouchProtocol(asyncio.DatagramProtocol):
 
     def __init__(
-        self, nanoleaf_host: str, callback: Callable[[TouchStreamEvent], Any]
+        self,
+        allowed_addresses: frozenset[str],
+        callback: Callable[[TouchStreamEvent], Any],
     ) -> None:
-        self._nanoleaf_host = nanoleaf_host
+        self._allowed_addresses = allowed_addresses
         self._callback = callback
+        self._tasks: set[asyncio.Task[Any]] = set()
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self.transport = transport
 
     def datagram_received(self, data: bytes, addr: Any) -> None:
-        # Security check: only accept packets from the known Nanoleaf host
-        if addr[0] != self._nanoleaf_host:
+        # Security check: only accept packets from the known Nanoleaf host.
+        # Both sides are normalized so a bracketed, zone-suffixed or
+        # IPv4-mapped address still matches the configured host.
+        source = _normalize_address(str(addr[0]))
+        if source is None or source not in self._allowed_addresses:
             return
-            
-        # Parse the binary protocol manually
-        # Note: This could be optimized using struct.unpack instead of string manipulation
-        binary = bin(int.from_bytes(data, byteorder="big"))
-        binary = binary[3:]  # Remove '0b1' prefix padding if present
-        
-        event = TouchStreamEvent(
-            panel_id=int(binary[:16], 2),        # First 2 bytes
-            touch_type_id=int(binary[16:20], 2), # Nibble after panel id
-            strength=int(binary[20:24], 2),      # Nibble after touch type
-            panel_id_2=int(binary[24:], 2),      # Remaining bits
-        )
-        asyncio.create_task(self._callback(event))
+
+        for event in parse_touch_stream(data):
+            task = asyncio.ensure_future(self._callback(event))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)

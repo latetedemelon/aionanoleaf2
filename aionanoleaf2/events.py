@@ -31,6 +31,9 @@ from .typing import (
     TouchEventData,
 )
 
+# The touch data stream reports 0xFFFF when a swipe has no destination panel.
+NO_PANEL_ID = 0xFFFF
+
 SINGLE_TAP = "Single Tap"
 DOUBLE_TAP = "Double Tap"
 SWIPE_UP = "Swipe Up"
@@ -197,7 +200,7 @@ class TouchStreamEvent:
 
     @property
     def panel_id_2(self) -> int | None:
-        """Return second panel ID."""
-        if self._panel_id_2 == 2 ^ 16:
+        """Return the panel a swipe ended on, or None if there is none."""
+        if self._panel_id_2 == NO_PANEL_ID:
             return None
         return self._panel_id_2
