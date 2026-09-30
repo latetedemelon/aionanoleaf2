@@ -1,0 +1,38 @@
+# NOTE: move this file to .github/workflows/ci.yaml to activate it.
+# It could not be committed there directly: the token used to open this
+# branch lacks the GitHub 'workflow' scope, which is required to add or
+# change files under .github/workflows/.
+name: Continuous integration
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+      - name: Lint with flake8
+        run: |
+          # stop the build on syntax errors or undefined names
+          flake8 aionanoleaf2 --count --select=E9,F63,F7,F82 --show-source --statistics
+          # full run, configured by .flake8
+          flake8 aionanoleaf2 tests --count --statistics
+      - name: Type check with mypy
+        run: mypy aionanoleaf2
+      - name: Test with pytest
+        run: pytest -q
