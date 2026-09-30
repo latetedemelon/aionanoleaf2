@@ -41,3 +41,9 @@ class Unauthorized(NanoleafException):
 
 class Unavailable(NanoleafException):
     """Device is unavailable."""
+
+class UnknownPanel(NanoleafException, KeyError):
+    """Panel ID is not part of this device's layout."""
+
+class StreamingUnsupported(NanoleafException):
+    """Device did not accept an external control streaming session."""
