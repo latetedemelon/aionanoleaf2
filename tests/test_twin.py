@@ -513,3 +513,169 @@ async def test_a_refused_mode_switch_also_restores(device, make_nanoleaf) -> Non
 
     assert device.bodies[-1] == {"select": "Nemo"}
     assert not twin.is_streaming
+
+
+# --------------------------------------------------------------------------
+# Writing a subset, and dimming what gets written
+# --------------------------------------------------------------------------
+
+def test_only_restricts_the_frame(twin: DigitalTwin) -> None:
+    twin.set_all((10, 20, 30))
+    assert decode(twin._build_stream_frame(0, only=[1, 3])) == [
+        (1, 10, 20, 30, 0, 0),
+        (3, 10, 20, 30, 0, 0),
+    ]
+
+
+def test_only_follows_buffer_order_not_the_callers(twin: DigitalTwin) -> None:
+    twin.set_all((1, 1, 1))
+    frame = twin._build_stream_frame(0, only=[3, 1])
+    assert [record[0] for record in decode(frame)] == [1, 3]
+
+
+def test_only_restricts_anim_data(twin: DigitalTwin) -> None:
+    twin.set_all((5, 5, 5))
+    assert twin._build_anim_data(0, only=[2]).split()[0] == "1"
+
+
+def test_only_with_an_unknown_panel_is_rejected(twin: DigitalTwin) -> None:
+    with pytest.raises(UnknownPanel):
+        twin._build_anim_data(0, only=[1, 99])
+
+
+def test_only_with_nothing_selected_is_rejected(twin: DigitalTwin) -> None:
+    with pytest.raises(UnknownPanel, match="No panels selected"):
+        twin._build_anim_data(0, only=[])
+
+
+def test_brightness_dims_what_is_written_without_touching_the_buffer(twin: DigitalTwin) -> None:
+    twin.set_all((200, 100, 50, 20))
+    assert decode(twin._build_stream_frame(0, brightness=50)) == [
+        (1, 100, 50, 25, 10, 0),
+        (2, 100, 50, 25, 10, 0),
+        (3, 100, 50, 25, 10, 0),
+    ]
+    # The buffer itself is unchanged, so the same twin can be written again.
+    assert twin.get_color(1) == (200, 100, 50, 20)
+
+
+@pytest.mark.parametrize(
+    ("brightness", "expected"),
+    [
+        (None, (200, 100, 50, 0)),
+        (100, (200, 100, 50, 0)),
+        (0, (0, 0, 0, 0)),
+        # 50 * 0.25 is 12.5, and round() breaks ties to even.
+        (25, (50, 25, 12, 0)),
+    ],
+)
+def test_brightness_levels(twin: DigitalTwin, brightness, expected) -> None:
+    twin.set_all((200, 100, 50))
+    assert decode(twin._build_stream_frame(0, brightness=brightness))[0][1:5] == expected
+
+
+@pytest.mark.parametrize("brightness", [-1, 101, 500])
+def test_an_out_of_range_brightness_is_rejected(twin: DigitalTwin, brightness) -> None:
+    with pytest.raises(ValueError, match="0-100"):
+        twin._build_anim_data(0, brightness=brightness)
+
+
+@pytest.mark.parametrize("brightness", [True, 1.5, "50"])
+def test_a_non_int_brightness_is_rejected(twin: DigitalTwin, brightness) -> None:
+    with pytest.raises(TypeError):
+        twin._build_anim_data(0, brightness=brightness)
+
+
+async def test_sync_passes_only_and_brightness_through(device, make_nanoleaf) -> None:
+    nanoleaf = make_nanoleaf()
+    twin = await nanoleaf.digital_twin()
+    twin.set_all((100, 100, 100))
+    await twin.sync(only=[1], brightness=50)
+    assert device.effect_writes[-1]["animData"] == "1 1 1 50 50 50 0 0"
+
+
+# --------------------------------------------------------------------------
+# Temporary display
+# --------------------------------------------------------------------------
+
+async def test_show_temporarily_uses_the_device_command_and_restores(
+    device, make_nanoleaf
+) -> None:
+    nanoleaf = make_nanoleaf()
+    await nanoleaf.get_info()
+    twin = await nanoleaf.digital_twin()
+    twin.set_all((255, 0, 0))
+
+    await twin.show_temporarily(0.01)
+
+    # displayTemp leaves the selected effect alone, so restoring is a re-select.
+    assert device.effect_writes[-1]["command"] == "displayTemp"
+    assert device.effect_writes[-1]["animType"] == "static"
+    assert device.bodies[-1] == {"select": "Nemo"}
+
+
+async def test_show_temporarily_can_leave_the_colour_up(device, make_nanoleaf) -> None:
+    nanoleaf = make_nanoleaf()
+    await nanoleaf.get_info()
+    twin = await nanoleaf.digital_twin()
+    await twin.show_temporarily(0.01, restore_effect=False)
+    assert {"select": "Nemo"} not in device.bodies
+
+
+async def test_show_temporarily_honours_only_and_brightness(device, make_nanoleaf) -> None:
+    nanoleaf = make_nanoleaf()
+    twin = await nanoleaf.digital_twin()
+    twin.set_all((100, 100, 100))
+    await twin.show_temporarily(0.01, only=[2], brightness=50)
+    assert device.effect_writes[-1]["animData"] == "1 2 1 50 50 50 0 0"
+
+
+async def test_a_failed_restore_does_not_mask_a_display_error(
+    device, make_nanoleaf, monkeypatch, caplog
+) -> None:
+    nanoleaf = make_nanoleaf()
+    await nanoleaf.get_info()
+    twin = await nanoleaf.digital_twin()
+
+    async def boom(effect: str) -> None:
+        raise Unavailable("device went away")
+
+    monkeypatch.setattr(nanoleaf, "set_effect", boom)
+    monkeypatch.setattr(
+        nanoleaf, "_write_static_effect", _raiser(RuntimeError("display failed"))
+    )
+
+    with pytest.raises(RuntimeError, match="display failed"):
+        await twin.show_temporarily(0.01)
+    assert "Could not restore effect" in caplog.text
+
+
+def _raiser(exc: BaseException):
+    async def _raise(*args, **kwargs):
+        raise exc
+
+    return _raise
+
+
+async def test_a_negative_duration_is_rejected(device, make_nanoleaf) -> None:
+    nanoleaf = make_nanoleaf()
+    twin = await nanoleaf.digital_twin()
+    with pytest.raises(ValueError, match="negative"):
+        await twin.show_temporarily(-1)
+
+
+async def test_show_temporarily_is_refused_while_streaming(
+    device, make_nanoleaf, udp_sink
+) -> None:
+    device.ext_control_response = {"streamControlPort": udp_sink.port}
+    nanoleaf = make_nanoleaf()
+    twin = await nanoleaf.digital_twin()
+    async with twin.streaming():
+        with pytest.raises(NanoleafException, match="streaming"):
+            await twin.show_temporarily(0.01)
+
+
+async def test_an_invalid_write_command_is_rejected(device, make_nanoleaf) -> None:
+    nanoleaf = make_nanoleaf()
+    with pytest.raises(ValueError, match="displayTemp"):
+        await nanoleaf._write_static_effect("1 1 1 0 0 0 0 0", command="wipe")

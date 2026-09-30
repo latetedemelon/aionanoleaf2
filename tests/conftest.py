@@ -76,6 +76,12 @@ class FakeNanoleaf:
         self.ext_control_response: dict[str, Any] | None = None
         self.effect_writes: list[dict[str, Any]] = []
         self.effects_status = 204
+        # Audio module payload; None means the device has no module (404).
+        self.rhythm: dict[str, Any] | None = None
+        # Layout rotation; None means the resource is absent (404).
+        self.orientation: Any = None
+        # Answer to the requestAll effects write.
+        self.effect_details: Any = None
         self.requests: list[tuple[str, str]] = []
         self.bodies: list[Any] = []
         self._runner: web.AppRunner | None = None
@@ -131,13 +137,30 @@ class FakeNanoleaf:
 
         if suffix == "effects" and request.method == "PUT":
             body = self.bodies[-1]
-            if "write" in body:
-                self.effect_writes.append(body["write"])
+            write = body.get("write", {})
+            if write:
+                self.effect_writes.append(write)
             if self.effects_status != 204:
                 return web.Response(status=self.effects_status)
+            if write.get("command") == "requestAll":
+                if self.effect_details is None:
+                    return web.Response(status=404)
+                return web.json_response(self.effect_details)
             if self.ext_control_response is not None:
                 return web.json_response(self.ext_control_response)
             return web.Response(status=204)
+
+        if suffix == "rhythm":
+            if request.method == "GET":
+                if self.rhythm is None:
+                    return web.Response(status=404)
+                return web.json_response(self.rhythm)
+            return web.Response(status=204)
+
+        if suffix == "panelLayout/globalOrientation" and request.method == "GET":
+            if self.orientation is None:
+                return web.Response(status=404)
+            return web.json_response(self.orientation)
 
         if suffix == "state" and request.method == "GET":
             if self.state is None:

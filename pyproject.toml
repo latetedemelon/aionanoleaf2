@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aionanoleaf2"
-version = "1.1.0"
+version = "1.2.0"
 description = "Async Python package for the Nanoleaf API that replaces aioNanoleaf."
 readme = "README.md"
 requires-python = ">=3.9"
