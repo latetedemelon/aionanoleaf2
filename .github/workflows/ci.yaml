@@ -1,7 +1,3 @@
-# NOTE: move this file to .github/workflows/ci.yaml to activate it.
-# It could not be committed there directly: the token used to open this
-# branch lacks the GitHub 'workflow' scope, which is required to add or
-# change files under .github/workflows/.
 name: Continuous integration
 
 on:
