@@ -61,6 +61,9 @@ _DECISECOND = 0.1
 # A transition time has to fit the uint16 the wire format reserves for it.
 _MAX_TRANSITION_UNITS = 0xFFFF
 
+# Panel IDs are uint16 on the wire.
+_MAX_PANEL_ID = 0xFFFF
+
 #: One panel's colour: red, green, blue and white, each 0-255.
 RGBW = Tuple[int, int, int, int]
 
@@ -86,6 +89,17 @@ def _coerce_color(color: Sequence[int]) -> RGBW:
     return components
 
 
+def _check_panel_id(panel_id: int) -> int:
+    """Return the panel ID if both transports can carry it."""
+    if not isinstance(panel_id, int) or isinstance(panel_id, bool):
+        raise TypeError(f"Panel IDs must be ints, got {panel_id!r}")
+    if not 0 <= panel_id <= _MAX_PANEL_ID:
+        raise UnknownPanel(
+            f"Panel IDs must be 0-{_MAX_PANEL_ID}, got {panel_id}"
+        )
+    return panel_id
+
+
 def _transition_units(transition: float | None) -> int:
     """Convert a transition in seconds to the tenths of a second the API wants."""
     if transition is None:
@@ -107,14 +121,17 @@ class DigitalTwin:
     def __init__(self, nanoleaf: Nanoleaf, panel_ids: Iterable[int]) -> None:
         """Build a twin for the given panels, all starting black."""
         self._nanoleaf = nanoleaf
+        self._stream: _PanelStream | None = None
+        # Checked here rather than at sync() time, where an out-of-range ID
+        # would be silently formatted into animData by the HTTP path and only
+        # rejected by struct on the streaming one.
         self._colors: dict[int, RGBW] = {
-            int(panel_id): (0, 0, 0, 0) for panel_id in panel_ids
+            _check_panel_id(panel_id): (0, 0, 0, 0) for panel_id in panel_ids
         }
         if not self._colors:
             raise NanoleafException(
                 "Cannot build a digital twin for a device with no panels"
             )
-        self._stream: _PanelStream | None = None
 
     def __repr__(self) -> str:
         """Return a readable representation."""
@@ -207,8 +224,18 @@ class DigitalTwin:
             raise NanoleafException("A streaming session is already open")
 
         previous_effect = self._nanoleaf.selected_effect
-        host, port = await self._nanoleaf._enable_external_control()
-        stream = await _PanelStream.open(host, port)
+
+        # The device may accept the mode switch and still leave us unable to
+        # stream -- an implausible port, a protocol we do not speak, a socket
+        # that will not open. Every one of those has to run the restore, or the
+        # panels are left in external control with nobody sending frames.
+        try:
+            host, port = await self._nanoleaf._enable_external_control()
+            stream = await _PanelStream.open(host, port)
+        except BaseException:
+            await self._restore(restore_effect, previous_effect)
+            raise
+
         self._stream = stream
         _LOGGER.debug("Streaming to %s:%s for %s panels", host, port, len(self._colors))
         try:
@@ -216,8 +243,23 @@ class DigitalTwin:
         finally:
             self._stream = None
             stream.close()
-            if restore_effect and previous_effect is not None:
-                await self._nanoleaf.set_effect(previous_effect)
+            await self._restore(restore_effect, previous_effect)
+
+    async def _restore(self, restore_effect: bool, effect: str | None) -> None:
+        """Re-select the effect that was active before streaming, best effort.
+
+        Runs while an exception from the caller's block may be in flight, so a
+        failure here is logged rather than raised: replacing that exception
+        would hide what actually went wrong.
+        """
+        if not restore_effect or effect is None:
+            return
+        try:
+            await self._nanoleaf.set_effect(effect)
+        except Exception:
+            _LOGGER.warning(
+                "Could not restore effect %r after streaming", effect, exc_info=True
+            )
 
     def _build_stream_frame(self, transition_units: int) -> bytes:
         """Encode the buffer as an external control v2 datagram."""
@@ -259,9 +301,9 @@ class _PanelStream:
             transport, _ = await loop.create_datagram_endpoint(
                 asyncio.DatagramProtocol, remote_addr=(host, port)
             )
-        except OSError as err:
+        except (OSError, OverflowError, ValueError) as err:
             raise StreamingUnsupported(
-                f"Could not open a streaming socket to {host}:{port}"
+                f"Could not open a streaming socket to {host}:{port}: {err}"
             ) from err
         return cls(transport)
 

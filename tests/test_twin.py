@@ -6,7 +6,13 @@ import struct
 
 import pytest
 
-from aionanoleaf2 import DigitalTwin, NanoleafException, StreamingUnsupported, UnknownPanel
+from aionanoleaf2 import (
+    DigitalTwin,
+    NanoleafException,
+    StreamingUnsupported,
+    Unavailable,
+    UnknownPanel,
+)
 from aionanoleaf2.twin import STREAM_PORT_V2, _coerce_color, _transition_units
 
 RECORD = struct.Struct(">HBBBBH")
@@ -372,3 +378,138 @@ async def test_ipv6_host_is_unbracketed_for_the_socket(session) -> None:
     nanoleaf = Nanoleaf(session, "fe80::1%eth0", auth_token="T")
     assert nanoleaf.host == "[fe80::1%eth0]"
     assert nanoleaf._bare_host == "fe80::1%eth0"
+
+
+# --------------------------------------------------------------------------
+# Panel ID validation
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("panel_id", [-1, 65536, 70000])
+def test_panel_ids_must_fit_the_wire_format(make_nanoleaf, panel_id) -> None:
+    """The HTTP path would format these into animData unchecked, and the
+    streaming path would fail deep inside struct.pack."""
+    with pytest.raises(UnknownPanel, match="0-65535"):
+        DigitalTwin(make_nanoleaf(), [panel_id])
+
+
+@pytest.mark.parametrize("panel_id", [1.0, "1", None, True])
+def test_panel_ids_must_be_ints(make_nanoleaf, panel_id) -> None:
+    with pytest.raises(TypeError, match="Panel IDs must be ints"):
+        DigitalTwin(make_nanoleaf(), [panel_id])
+
+
+@pytest.mark.parametrize("panel_id", [0, 65535])
+def test_panel_ids_at_the_bounds_are_accepted(make_nanoleaf, panel_id) -> None:
+    twin = DigitalTwin(make_nanoleaf(), [panel_id])
+    twin.set_color(panel_id, (1, 2, 3))
+    assert decode(twin._build_stream_frame(0)) == [(panel_id, 1, 2, 3, 0, 0)]
+
+
+# --------------------------------------------------------------------------
+# Streaming teardown must not swallow or mask errors
+# --------------------------------------------------------------------------
+
+async def test_restore_failure_does_not_mask_the_callers_error(
+    device, make_nanoleaf, udp_sink, monkeypatch, caplog
+) -> None:
+    """A failed restore in the finally block must not replace the real error."""
+    device.ext_control_response = {"streamControlPort": udp_sink.port}
+    nanoleaf = make_nanoleaf()
+    await nanoleaf.get_info()
+    twin = await nanoleaf.digital_twin()
+
+    async def boom(effect: str) -> None:
+        raise Unavailable("device went away")
+
+    monkeypatch.setattr(nanoleaf, "set_effect", boom)
+
+    with pytest.raises(RuntimeError, match="what the caller cares about"):
+        async with twin.streaming(restore_effect=True):
+            raise RuntimeError("what the caller cares about")
+
+    assert "Could not restore effect" in caplog.text
+    assert not twin.is_streaming
+
+
+async def test_restore_failure_on_a_clean_exit_is_logged_not_raised(
+    device, make_nanoleaf, udp_sink, monkeypatch, caplog
+) -> None:
+    device.ext_control_response = {"streamControlPort": udp_sink.port}
+    nanoleaf = make_nanoleaf()
+    await nanoleaf.get_info()
+    twin = await nanoleaf.digital_twin()
+
+    async def boom(effect: str) -> None:
+        raise Unavailable("device went away")
+
+    monkeypatch.setattr(nanoleaf, "set_effect", boom)
+
+    async with twin.streaming(restore_effect=True):
+        await twin.sync()
+
+    assert "Could not restore effect" in caplog.text
+
+
+async def test_a_socket_that_never_opens_still_restores(
+    device, make_nanoleaf, monkeypatch
+) -> None:
+    """External control is already enabled by then, so it must be undone."""
+    device.ext_control_response = {"streamControlPort": 60222}
+    nanoleaf = make_nanoleaf()
+    await nanoleaf.get_info()
+    twin = await nanoleaf.digital_twin()
+
+    async def refuse(host: str, port: int):
+        raise StreamingUnsupported("no socket for you")
+
+    monkeypatch.setattr("aionanoleaf2.twin._PanelStream.open", refuse)
+
+    with pytest.raises(StreamingUnsupported):
+        async with twin.streaming(restore_effect=True):
+            pytest.fail("the body must not run")
+
+    assert not twin.is_streaming
+    assert device.bodies[-1] == {"select": "Nemo"}
+
+
+async def test_socket_errors_are_wrapped(make_nanoleaf) -> None:
+    """A bad port raises OverflowError, which is not an OSError."""
+    from aionanoleaf2.twin import _PanelStream
+
+    with pytest.raises(StreamingUnsupported):
+        await _PanelStream.open("127.0.0.1", 99999)
+    with pytest.raises(StreamingUnsupported):
+        await _PanelStream.open("nonexistent.invalid", 60222)
+
+
+@pytest.mark.parametrize("reported", [0, 99999, -1])
+async def test_an_out_of_range_reported_port_is_refused(
+    device, make_nanoleaf, reported
+) -> None:
+    device.ext_control_response = {"streamControlPort": reported}
+    nanoleaf = make_nanoleaf()
+    with pytest.raises(StreamingUnsupported, match="out-of-range"):
+        await nanoleaf._enable_external_control()
+
+
+async def test_an_unparseable_reported_port_is_refused(device, make_nanoleaf) -> None:
+    device.ext_control_response = {"streamControlPort": "not-a-port"}
+    nanoleaf = make_nanoleaf()
+    with pytest.raises(StreamingUnsupported, match="unusable"):
+        await nanoleaf._enable_external_control()
+
+
+async def test_a_refused_mode_switch_also_restores(device, make_nanoleaf) -> None:
+    """The device can accept the extControl write and still report a port we
+    cannot use, which leaves it in external control unless we undo it."""
+    device.ext_control_response = {"streamControlPort": 99999}
+    nanoleaf = make_nanoleaf()
+    await nanoleaf.get_info()
+    twin = await nanoleaf.digital_twin()
+
+    with pytest.raises(StreamingUnsupported, match="out-of-range"):
+        async with twin.streaming(restore_effect=True):
+            pytest.fail("the body must not run")
+
+    assert device.bodies[-1] == {"select": "Nemo"}
+    assert not twin.is_streaming

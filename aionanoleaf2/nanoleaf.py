@@ -745,7 +745,16 @@ class Nanoleaf:
                     f"Device asked for {protocol} streaming, which is not supported"
                 )
             if (reported := data.get("streamControlPort")) is not None:
-                port = int(reported)
+                try:
+                    port = int(reported)
+                except (TypeError, ValueError) as err:
+                    raise StreamingUnsupported(
+                        f"Device reported an unusable streaming port {reported!r}"
+                    ) from err
+                if not 1 <= port <= 65535:
+                    raise StreamingUnsupported(
+                        f"Device reported an out-of-range streaming port {port}"
+                    )
 
         return self._bare_host, port
 
