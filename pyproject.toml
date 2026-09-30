@@ -43,6 +43,10 @@ aionanoleaf2 = ["py.typed"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Put the repo root on sys.path so `tests.conftest` resolves. Without it the
+# suite only passes when invoked as `python -m pytest`, which adds the working
+# directory implicitly; a bare `pytest` (what CI runs) fails at collection.
+pythonpath = ["."]
 
 [tool.mypy]
 warn_unused_ignores = true
