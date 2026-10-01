@@ -228,10 +228,17 @@ class DigitalTwin:
         a static effect over HTTP. `transition` is in seconds and is rounded
         to the tenth of a second the device works in.
 
-        `only` restricts the write to a subset of panels, leaving the rest as
-        the device last had them. `brightness` dims the colours being written
-        by a 0-100 percentage without changing the buffer, so the same buffer
-        can be written at different levels.
+        `brightness` dims the colours being written by a 0-100 percentage
+        without changing the buffer, so the same buffer can be written at
+        different levels.
+
+        `only` restricts the write to a subset of panels, but what that means
+        depends on the transport. A streaming frame updates just the panels it
+        names and leaves the others alone. A static effect, which is what the
+        HTTP path writes, describes a whole scene -- so panels left out of it
+        are not preserved, and the device is expected to blank them. Use `only`
+        for streaming; over HTTP, keep the full buffer and set the panels you
+        want unchanged to their current colours instead.
         """
         units = _transition_units(transition)
         if self._stream is not None:

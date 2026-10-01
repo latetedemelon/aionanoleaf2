@@ -220,15 +220,23 @@ and persists until another effect is selected, but each call is a round trip.
 Read the buffer back with `twin.get_color(panel_id)` or `twin.colors`, which
 returns a copy as a `{panel_id: (r, g, b, w)}` dict.
 
-`sync()` takes two more options. `only` writes just some panels and leaves the
-rest as the device last had them; `brightness` dims what is written by a 0-100
-percentage without changing the buffer, so one buffer can be written at several
-levels:
+`sync()` takes two more options:
 
 ```python
-await twin.sync(only=[1, 2])
-await twin.sync(brightness=40)
+await twin.sync(brightness=40)    # dim what is written, buffer unchanged
+await twin.sync(only=[1, 2])      # write a subset (see the caveat below)
 ```
+
+`brightness` not touching the buffer is the point: one buffer can be written at
+several levels without rebuilding it.
+
+`only` means different things on the two transports, so it is worth being
+precise. A streaming frame updates just the panels it names and leaves the rest
+alone, which is what makes partial updates cheap during animation. The HTTP path
+writes a *static effect*, and a static effect describes a whole scene — panels
+omitted from it are not preserved, and the device is expected to blank them. So
+use `only` while streaming; over HTTP, keep the full buffer and write the panels
+you want unchanged at their existing colours.
 
 ### A temporary flash
 
