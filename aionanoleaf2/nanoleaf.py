@@ -29,8 +29,8 @@ import socket
 import struct
 
 from .layout import Panel
-from typing import Any, Callable, Iterable
-from .typing import InfoData, EmersionData
+from typing import Any, Callable, Iterable, cast
+from .typing import InfoData, EmersionData, RhythmData
 
 from aiohttp import (
     ClientConnectorError,
@@ -53,6 +53,7 @@ from .events import (
 from .exceptions import (
     InvalidEffect,
     InvalidEmersion,
+    InvalidRhythmMode,
     InvalidToken,
     NanoleafException,
     NoAuthToken,
@@ -76,6 +77,16 @@ _TOUCH_RECORD = struct.Struct(">HBH")
 
 # Raised when an optional sub-resource is absent (404) or the device is away.
 _OPTIONAL_RESOURCE_ERRORS = (Unavailable, ClientResponseError)
+
+# Audio sources the rhythm module can listen on, as the API numbers them.
+RHYTHM_MODES = {0: "microphone", 1: "aux"}
+RHYTHM_MODES_INVERTED = {"microphone": 0, "mic": 0, "aux": 1}
+
+# Effects that react to audio are plugin effects of this type.
+RHYTHM_PLUGIN_TYPE = "rhythm"
+
+# The panel layout can be rotated through a full turn.
+_MAX_ORIENTATION = 360
 
 # Models that support Screen Mirroring
 EMERSION_MODELS = ["NL69"]
@@ -136,6 +147,8 @@ class Nanoleaf:
         self._emersion_list: list[str] = []
         self._emersion = ""
         self._panels: set[Panel] = set()
+        self._rhythm: RhythmData = {}
+        self._global_orientation: int | None = None
         # asyncio only holds weak references to tasks, so keep our own.
         self._tasks: set[asyncio.Task[Any]] = set()
 
@@ -266,6 +279,56 @@ class Nanoleaf:
     @property
     def panels(self) -> set[Panel]:
         return self._panels
+
+    @property
+    def rhythm(self) -> RhythmData:
+        """Return the audio module payload from the last get_rhythm() call."""
+        return self._rhythm
+
+    @property
+    def has_rhythm(self) -> bool:
+        """Return whether an audio module is attached.
+
+        Devices with the module built in report rhythmConnected; the oldest
+        Light Panels firmwares report the rest of the payload without it, so
+        any recognisable key counts.
+        """
+        connected = self._rhythm.get("rhythmConnected")
+        if connected is not None:
+            return bool(connected)
+        return any(key in self._rhythm for key in ("rhythmMode", "rhythmActive"))
+
+    @property
+    def rhythm_active(self) -> bool:
+        """Return whether the audio module is currently picking up sound."""
+        return bool(self._rhythm.get("rhythmActive"))
+
+    @property
+    def rhythm_aux_available(self) -> bool:
+        """Return whether the module exposes a 3.5mm aux input."""
+        return bool(self._rhythm.get("auxAvailable"))
+
+    @property
+    def rhythm_mode(self) -> str | None:
+        """Return the selected audio source, or None if it is not reported."""
+        mode = self._rhythm.get("rhythmMode")
+        if isinstance(mode, bool) or not isinstance(mode, int):
+            return None
+        return RHYTHM_MODES.get(mode)
+
+    @property
+    def rhythm_mode_list(self) -> list[str]:
+        """Return the audio sources this device can actually use."""
+        if not self.has_rhythm:
+            return []
+        if self.rhythm_aux_available:
+            return ["microphone", "aux"]
+        return ["microphone"]
+
+    @property
+    def global_orientation(self) -> int | None:
+        """Return the layout rotation from the last get_global_orientation()."""
+        return self._global_orientation
 
     @property
     def _api_url(self) -> str:
@@ -455,6 +518,121 @@ class Nanoleaf:
 
     
     
+# Fetch the audio module state. Returns {} on devices without one.
+    async def get_rhythm(self) -> RhythmData:
+        """Read the audio module resource and cache it on this instance.
+
+        Devices without an audio module answer 404, which is reported as an
+        empty payload rather than an error: absence is the normal case.
+        """
+        try:
+            resp = await self._request("get", "rhythm")
+            data = await resp.json()
+        except _OPTIONAL_RESOURCE_ERRORS:
+            _LOGGER.debug("%s: no rhythm module", self._host)
+            self._rhythm = {}
+            return self._rhythm
+
+        # The device answers with the resource as-is; trust the shape only
+        # far enough to know it is a mapping.
+        self._rhythm = cast(RhythmData, data) if isinstance(data, dict) else {}
+        return self._rhythm
+
+
+
+# Choose which audio source the rhythm module listens on.
+    async def set_rhythm_mode(self, mode: int | str) -> None:
+        """Select the audio source, by name ("microphone"/"mic"/"aux") or number."""
+        if isinstance(mode, str):
+            resolved = RHYTHM_MODES_INVERTED.get(mode.strip().lower())
+            if resolved is None:
+                raise InvalidRhythmMode(
+                    f"Unknown audio source {mode!r}; "
+                    f"expected one of {sorted(RHYTHM_MODES_INVERTED)}"
+                )
+        elif isinstance(mode, bool) or not isinstance(mode, int):
+            raise InvalidRhythmMode(f"Audio source must be an int or a name, got {mode!r}")
+        elif mode not in RHYTHM_MODES:
+            raise InvalidRhythmMode(
+                f"Unknown audio source {mode}; expected one of {sorted(RHYTHM_MODES)}"
+            )
+        else:
+            resolved = mode
+
+        await self._request("put", "rhythm", {"rhythmMode": resolved})
+        # Keep the cached payload consistent without a second round trip.
+        if self._rhythm:
+            self._rhythm["rhythmMode"] = resolved
+
+
+
+# Fetch metadata for every effect stored on the device.
+    async def get_effect_details(self) -> list[dict[str, Any]]:
+        """Return the device's effect list with metadata.
+
+        Each entry carries at least animName, and plugin effects also carry
+        pluginType. Firmwares that do not answer in this shape give [].
+        """
+        try:
+            resp = await self._request(
+                "put", "effects", {"write": {"command": "requestAll"}}
+            )
+            data = await resp.json()
+        except _OPTIONAL_RESOURCE_ERRORS:
+            return []
+
+        if isinstance(data, dict):
+            animations = data.get("animations")
+            if isinstance(animations, list):
+                return [a for a in animations if isinstance(a, dict)]
+        return []
+
+
+
+# Fetch the names of effects that react to audio.
+    async def get_rhythm_effects(self) -> list[str]:
+        """Return the sound-reactive effect names, i.e. the music-sync ones."""
+        return [
+            name
+            for animation in await self.get_effect_details()
+            if animation.get("pluginType") == RHYTHM_PLUGIN_TYPE
+            and isinstance(name := animation.get("animName"), str)
+        ]
+
+
+
+# Fetch how far the panel layout is rotated.
+    async def get_global_orientation(self) -> int | None:
+        """Read the layout rotation in degrees, or None if it is not reported."""
+        try:
+            resp = await self._request("get", "panelLayout/globalOrientation")
+            data = await resp.json()
+        except _OPTIONAL_RESOURCE_ERRORS:
+            self._global_orientation = None
+            return None
+
+        # Reported bare by some firmwares and wrapped in a value object by others.
+        if isinstance(data, dict):
+            data = data.get("value")
+        self._global_orientation = data if isinstance(data, int) else None
+        return self._global_orientation
+
+
+
+# Rotate the panel layout.
+    async def set_global_orientation(self, angle: int) -> None:
+        """Set the layout rotation, in degrees from 0 to 360."""
+        if isinstance(angle, bool) or not isinstance(angle, int):
+            raise ValueError(f"Orientation must be an int, got {angle!r}")
+        if not 0 <= angle <= _MAX_ORIENTATION:
+            raise ValueError(
+                f"Orientation must be 0-{_MAX_ORIENTATION} degrees, got {angle}"
+            )
+        await self._request("put", "panelLayout", {"globalOrientation": {"value": angle}})
+        self._global_orientation = angle
+
+
+
 # Build a digital twin: a local RGBW buffer with one entry per panel.
     async def digital_twin(
         self, panel_ids: Iterable[int] | None = None
@@ -693,13 +871,19 @@ class Nanoleaf:
 
 
 # Write a static effect, which is how per-panel colours are set over HTTP.
-    async def _write_static_effect(self, anim_data: str) -> None:
+    async def _write_static_effect(
+        self, anim_data: str, command: str = "display"
+    ) -> None:
+        # "displayTemp" shows the scene without replacing the selected effect,
+        # which is what makes a temporary flash restorable.
+        if command not in ("display", "displayTemp"):
+            raise ValueError(f'command must be "display" or "displayTemp", got {command!r}')
         await self._request(
             "put",
             "effects",
             {
                 "write": {
-                    "command": "display",
+                    "command": command,
                     "animType": "static",
                     "animData": anim_data,
                     "loop": False,

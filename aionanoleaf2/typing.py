@@ -85,6 +85,23 @@ class EmersionData(TypedDict):
     """Nanoleaf API Emersion data."""
     screenMirrorMode: int
 
+
+class RhythmData(TypedDict, total=False):
+    """Nanoleaf API rhythm (audio module) data.
+
+    Every field is optional: devices without an audio module omit the
+    resource entirely, and firmwares differ in which keys they report.
+    """
+
+    rhythmConnected: bool
+    rhythmActive: bool
+    rhythmId: int
+    hardwareVersion: str
+    firmwareVersion: str
+    auxAvailable: bool
+    rhythmMode: int
+    rhythmPos: dict
+
 class InfoData(TypedDict):
     """Nanoleaf API info."""
 

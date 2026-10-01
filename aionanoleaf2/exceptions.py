@@ -47,3 +47,6 @@ class UnknownPanel(NanoleafException, KeyError):
 
 class StreamingUnsupported(NanoleafException):
     """Device did not accept an external control streaming session."""
+
+class InvalidRhythmMode(NanoleafException, ValueError):
+    """Invalid rhythm (audio module) source specified."""

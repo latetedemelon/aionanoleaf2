@@ -64,6 +64,9 @@ _MAX_TRANSITION_UNITS = 0xFFFF
 # Panel IDs are uint16 on the wire.
 _MAX_PANEL_ID = 0xFFFF
 
+# The brightness overlay is a percentage of each panel's buffered colour.
+_MAX_BRIGHTNESS = 100
+
 #: One panel's colour: red, green, blue and white, each 0-255.
 RGBW = Tuple[int, int, int, int]
 
@@ -98,6 +101,24 @@ def _check_panel_id(panel_id: int) -> int:
             f"Panel IDs must be 0-{_MAX_PANEL_ID}, got {panel_id}"
         )
     return panel_id
+
+
+def _scale(color: RGBW, brightness: int | None) -> RGBW:
+    """Dim a colour by a 0-100 percentage, leaving it alone when None."""
+    if brightness is None or brightness == _MAX_BRIGHTNESS:
+        return color
+    if isinstance(brightness, bool) or not isinstance(brightness, int):
+        raise TypeError(f"Brightness must be an int, got {brightness!r}")
+    if not 0 <= brightness <= _MAX_BRIGHTNESS:
+        raise ValueError(f"Brightness must be 0-{_MAX_BRIGHTNESS}, got {brightness}")
+    factor = brightness / _MAX_BRIGHTNESS
+    red, green, blue, white = color
+    return (
+        round(red * factor),
+        round(green * factor),
+        round(blue * factor),
+        round(white * factor),
+    )
 
 
 def _transition_units(transition: float | None) -> int:
@@ -194,18 +215,72 @@ class DigitalTwin:
         for panel_id in self._colors:
             self._colors[panel_id] = value
 
-    async def sync(self, transition: float | None = None) -> None:
-        """Write the whole buffer to the device.
+    async def sync(
+        self,
+        transition: float | None = None,
+        *,
+        only: Iterable[int] | None = None,
+        brightness: int | None = None,
+    ) -> None:
+        """Write the buffer to the device.
 
         Sends a UDP frame when a streaming session is open, otherwise writes
         a static effect over HTTP. `transition` is in seconds and is rounded
         to the tenth of a second the device works in.
+
+        `brightness` dims the colours being written by a 0-100 percentage
+        without changing the buffer, so the same buffer can be written at
+        different levels.
+
+        `only` restricts the write to a subset of panels, but what that means
+        depends on the transport. A streaming frame updates just the panels it
+        names and leaves the others alone. A static effect, which is what the
+        HTTP path writes, describes a whole scene -- so panels left out of it
+        are not preserved, and the device is expected to blank them. Use `only`
+        for streaming; over HTTP, keep the full buffer and set the panels you
+        want unchanged to their current colours instead.
         """
         units = _transition_units(transition)
         if self._stream is not None:
-            self._stream.send(self._build_stream_frame(units))
+            self._stream.send(self._build_stream_frame(units, only, brightness))
             return
-        await self._nanoleaf._write_static_effect(self._build_anim_data(units))
+        await self._nanoleaf._write_static_effect(
+            self._build_anim_data(units, only, brightness)
+        )
+
+    async def show_temporarily(
+        self,
+        duration: float,
+        transition: float | None = None,
+        *,
+        only: Iterable[int] | None = None,
+        brightness: int | None = None,
+        restore_effect: bool = True,
+    ) -> None:
+        """Show the buffer for `duration` seconds, then put back what was there.
+
+        Uses the device's temporary display command, so the selected effect is
+        never replaced and restoring it is just a re-select. Useful for a
+        notification flash.
+
+        Restoring is best effort: a failure is logged rather than raised, so it
+        cannot mask an error from the display itself. Not available inside a
+        streaming session, where the device is not showing an effect at all.
+        """
+        if self._stream is not None:
+            raise NanoleafException(
+                "show_temporarily writes an effect, so it cannot be used while streaming"
+            )
+        if duration < 0:
+            raise ValueError(f"Duration must not be negative, got {duration}")
+
+        previous_effect = self._nanoleaf.selected_effect
+        anim_data = self._build_anim_data(_transition_units(transition), only, brightness)
+        try:
+            await self._nanoleaf._write_static_effect(anim_data, command="displayTemp")
+            await asyncio.sleep(duration)
+        finally:
+            await self._restore(restore_effect, previous_effect)
 
     @asynccontextmanager
     async def streaming(
@@ -261,19 +336,51 @@ class DigitalTwin:
                 "Could not restore effect %r after streaming", effect, exc_info=True
             )
 
-    def _build_stream_frame(self, transition_units: int) -> bytes:
+    def _selected(
+        self, only: Iterable[int] | None, brightness: int | None
+    ) -> list[tuple[int, RGBW]]:
+        """Return the panels to write, in buffer order, with brightness applied."""
+        if only is None:
+            chosen = list(self._colors)
+        else:
+            wanted = {int(panel_id) for panel_id in only}
+            unknown = wanted - set(self._colors)
+            if unknown:
+                raise UnknownPanel(
+                    f"Panels {sorted(unknown)} are not part of this twin; "
+                    f"known panels: {sorted(self._colors)}"
+                )
+            # Preserve buffer order rather than the caller's iteration order.
+            chosen = [panel_id for panel_id in self._colors if panel_id in wanted]
+            if not chosen:
+                raise UnknownPanel("No panels selected")
+        return [(panel_id, _scale(self._colors[panel_id], brightness)) for panel_id in chosen]
+
+    def _build_stream_frame(
+        self,
+        transition_units: int,
+        only: Iterable[int] | None = None,
+        brightness: int | None = None,
+    ) -> bytes:
         """Encode the buffer as an external control v2 datagram."""
-        frame = bytearray(_STREAM_HEADER.pack(len(self._colors)))
-        for panel_id, (red, green, blue, white) in self._colors.items():
+        selected = self._selected(only, brightness)
+        frame = bytearray(_STREAM_HEADER.pack(len(selected)))
+        for panel_id, (red, green, blue, white) in selected:
             frame += _STREAM_RECORD.pack(
                 panel_id, red, green, blue, white, transition_units
             )
         return bytes(frame)
 
-    def _build_anim_data(self, transition_units: int) -> str:
+    def _build_anim_data(
+        self,
+        transition_units: int,
+        only: Iterable[int] | None = None,
+        brightness: int | None = None,
+    ) -> str:
         """Encode the buffer as the animData string of a static effect."""
-        parts = [str(len(self._colors))]
-        for panel_id, (red, green, blue, white) in self._colors.items():
+        selected = self._selected(only, brightness)
+        parts = [str(len(selected))]
+        for panel_id, (red, green, blue, white) in selected:
             # panelId, frame count, colour, transition time
             parts += [
                 str(panel_id),

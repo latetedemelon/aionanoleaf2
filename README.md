@@ -147,6 +147,47 @@ await nanoleaf.set_effect("Nemo")
 `set_effect()` checks the name against `effects_list` and raises
 `InvalidEffect` if it is not there, so `get_info()` has to have run first.
 
+### Audio module (music sync)
+
+Devices with a rhythm module — built in on Canvas and Shapes, a clip-on unit on
+Light Panels — can drive effects from sound. The resource 404s on devices
+without one, which is reported as absence rather than an error:
+
+```python
+await nanoleaf.get_rhythm()
+
+if nanoleaf.has_rhythm:
+    print(nanoleaf.rhythm_active)          # is it picking up sound right now
+    print(nanoleaf.rhythm_mode)            # "microphone" or "aux"
+    print(nanoleaf.rhythm_mode_list)       # sources this unit actually has
+
+    await nanoleaf.set_rhythm_mode("mic")  # or "microphone", "aux", 0, 1
+
+    # Sound-reactive effects are plugin effects of type "rhythm".
+    for name in await nanoleaf.get_rhythm_effects():
+        print(name)                        # e.g. "Pulse Pop Beats"
+```
+
+Selecting one of those effects while the source is set starts music sync:
+
+```python
+await nanoleaf.set_rhythm_mode("microphone")
+await nanoleaf.set_effect("Pulse Pop Beats")
+```
+
+`nanoleaf.rhythm` is the raw payload if you need a field these properties do not
+cover, and `get_effect_details()` returns every effect's metadata rather than
+just the audio-reactive names.
+
+An unknown source raises `InvalidRhythmMode` before any request is sent.
+
+### Layout rotation
+
+```python
+await nanoleaf.get_global_orientation()    # degrees, or None if not reported
+await nanoleaf.set_global_orientation(90)  # 0-360
+```
+
 ### Screen Mirroring (emersion)
 
 Only reported by devices whose `model` appears in
@@ -178,6 +219,41 @@ and persists until another effect is selected, but each call is a round trip.
 
 Read the buffer back with `twin.get_color(panel_id)` or `twin.colors`, which
 returns a copy as a `{panel_id: (r, g, b, w)}` dict.
+
+`sync()` takes two more options:
+
+```python
+await twin.sync(brightness=40)    # dim what is written, buffer unchanged
+await twin.sync(only=[1, 2])      # write a subset (see the caveat below)
+```
+
+`brightness` not touching the buffer is the point: one buffer can be written at
+several levels without rebuilding it.
+
+`only` means different things on the two transports, so it is worth being
+precise. A streaming frame updates just the panels it names and leaves the rest
+alone, which is what makes partial updates cheap during animation. The HTTP path
+writes a *static effect*, and a static effect describes a whole scene — panels
+omitted from it are not preserved, and the device is expected to blank them. So
+use `only` while streaming; over HTTP, keep the full buffer and write the panels
+you want unchanged at their existing colours.
+
+### A temporary flash
+
+`show_temporarily()` displays the buffer for a while and then puts back
+whatever was showing. It uses the device's temporary-display command, so the
+selected effect is never replaced and restoring it is just a re-select — handy
+for a notification:
+
+```python
+twin.set_all((255, 0, 0))
+await twin.show_temporarily(2.0)             # red for two seconds, then back
+```
+
+Restoring is best effort: a failure is logged rather than raised, so it cannot
+mask an error from the display itself. Pass `restore_effect=False` to leave the
+colour up. Not available inside a streaming session, where the device is not
+showing an effect at all.
 
 ### Streaming
 
@@ -269,6 +345,7 @@ All of these derive from `NanoleafException`.
 | `InvalidToken` | the device rejected the token (HTTP 401) |
 | `InvalidEffect` | the effect name is not in `effects_list` |
 | `InvalidEmersion` | the emersion mode is not in `emersion_list` |
+| `InvalidRhythmMode` | the audio source is not a known name or number |
 | `UnknownPanel` | the panel is not part of the twin, or the ID is out of range |
 | `StreamingUnsupported` | the device would not start an external control session |
 
